@@ -1,30 +1,25 @@
-# netlify.toml — Non-Employee Hub CORS Proxy
+# netlify.toml — RSM Non-Employee Hub
 # ─────────────────────────────────────────────────────────────────────────────
-# SETUP INSTRUCTIONS
-#
-# 1. Replace YOUR-ORG below with your SailPoint tenant subdomain.
-#    Example: if your ISC URL is https://acme.api.identitynow.com
-#             then YOUR-ORG = acme
-#
-# 2. Include this file in the same folder as index.html and app.jsx
-#    when you drag-and-drop deploy to Netlify.
-#
-# 3. In the Non-Employee Hub → Configuration → Connectivity:
-#      API Endpoint:  /isc
-#      Proxy URL:     /isc
-#      Tenant URL:    (leave blank)
-#
-# 4. Save configuration and click "Test connectivity".
-#
-# HOW IT WORKS
-# The browser calls /isc/oauth/token and /isc/v2026/... (relative URLs —
-# same origin as the app). Netlify rewrites these server-side to the real
-# ISC API domain before sending them out, so the browser never makes a
-# cross-origin request and CORS is bypassed entirely.
+# Deployment: drag-and-drop the entire folder to Netlify.
+# Folder structure:
+#   index.html
+#   app.jsx
+#   netlify.toml
+#   netlify/functions/
+#       isc-proxy.js    ← server-side ISC proxy (required — fixes CORS)
 # ─────────────────────────────────────────────────────────────────────────────
 
-[[redirects]]
-  from   = "/isc/*"
-  to     = "https://partner19511.identitynow-demo.com/:splat"
-  status = 200
-  force  = true
+[build]
+  publish   = "."
+  functions = "netlify/functions"
+
+[functions]
+  node_bundler = "esbuild"
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options        = "SAMEORIGIN"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy        = "strict-origin-when-cross-origin"
+    Cache-Control          = "no-store"
