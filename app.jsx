@@ -25,6 +25,7 @@ const DEFAULT_SCHEMA_FIELD = { label:"", required:false, validationType:"none", 
 const DEFAULT_CONFIG = {
   clientName:"", contactEmail:"", notes:"",
   tenantUrl:"", apiEndpoint:"", clientId:"", clientSecret:"",
+  proxyUrl:"",
   sourceId:"",
   customAttributes:[],
   schemaFieldConfig:{},
@@ -231,29 +232,87 @@ function NonEmployeeHub() {
   const notify = (msg, type="success") => { setNotification({msg,type}); setTimeout(()=>setNotification(null),4500); };
 
   // ── API ───────────────────────────────────────────────────────────────────
+  // Derive a clean base URL for both OAuth token calls and REST API calls.
+  // ISC hosts the OAuth token endpoint on the same domain as the REST API
+  // (org.api.identitynow.com), NOT on the UI domain (org.identitynow.com).
+  // If the user has filled in a Proxy URL it takes precedence over everything.
+  const getBase = (cfg=config) =>
+    (cfg.proxyUrl || cfg.apiEndpoint || cfg.tenantUrl || "").replace(/\/+$/, "");
+
+  const CORS_HINT = "Cannot reach ISC — this is usually a CORS issue when calling ISC APIs directly from a browser. " +
+    "Fix options: (A) Add your Netlify domain to ISC's allowed CORS origins in Admin Console → Security Settings → API Management, " +
+    "or (B) set up a Netlify proxy — see the Setup guide in the Configuration tab.";
+
   const getToken = async (cfg=config) => {
     if (token && Date.now()<tokenExpiry) return token;
-    const res = await fetch(`${cfg.tenantUrl}/oauth/token`, { method:"POST", headers:{"Content-Type":"application/x-www-form-urlencoded"}, body:new URLSearchParams({ grant_type:"client_credentials", client_id:cfg.clientId, client_secret:cfg.clientSecret }) });
-    if (!res.ok) { const t=await res.text(); throw new Error(`Auth failed (${res.status}): ${t}`); }
-    const d = await res.json(); setToken(d.access_token); setTokenExpiry(Date.now()+(d.expires_in-60)*1000); return d.access_token;
+    if (!cfg.clientId || !cfg.clientSecret) throw new Error("Client ID and Client Secret are required.");
+    const base = getBase(cfg);
+    if (!base) throw new Error("No API endpoint configured — enter your Tenant URL or API Endpoint in Configuration.");
+    let res;
+    try {
+      res = await fetch(`${base}/oauth/token`, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ grant_type:"client_credentials", client_id:cfg.clientId, client_secret:cfg.clientSecret })
+      });
+    } catch(e) {
+      // TypeError / "Failed to fetch" = network-level block, almost always CORS
+      throw new Error(CORS_HINT);
+    }
+    if (!res.ok) {
+      const t = await res.text();
+      const msg = res.status === 401 ? "Invalid Client ID or Client Secret (401 Unauthorized)"
+                : res.status === 400 ? `Bad request — check Client ID/Secret format (400): ${t}`
+                : `Auth failed (${res.status}): ${t}`;
+      throw new Error(msg);
+    }
+    const d = await res.json();
+    setToken(d.access_token);
+    setTokenExpiry(Date.now() + (d.expires_in - 60) * 1000);
+    return d.access_token;
   };
+
   const apiCall = async (method, path, body, cfg=config) => {
-    const tok=await getToken(cfg), base=(cfg.apiEndpoint||cfg.tenantUrl).replace(/\/$/,"");
-    const res=await fetch(`${base}${path}`, { method, headers:{Authorization:`Bearer ${tok}`,"Content-Type":"application/json"}, body:body!==undefined?JSON.stringify(body):undefined });
+    const tok = await getToken(cfg);
+    const base = getBase(cfg);
+    let res;
+    try {
+      res = await fetch(`${base}${path}`, {
+        method,
+        headers: { Authorization:`Bearer ${tok}`, "Content-Type":"application/json" },
+        body: body !== undefined ? JSON.stringify(body) : undefined
+      });
+    } catch(e) { throw new Error(CORS_HINT); }
     if (!res.ok) { const t=await res.text(); throw new Error(`API ${res.status}: ${t}`); }
-    return res.status===204?null:res.json();
+    return res.status===204 ? null : res.json();
   };
+
   const patchCall = async (path, ops, cfg=config) => {
-    const tok=await getToken(cfg), base=(cfg.apiEndpoint||cfg.tenantUrl).replace(/\/$/,"");
-    const res=await fetch(`${base}${path}`, { method:"PATCH", headers:{Authorization:`Bearer ${tok}`,"Content-Type":"application/json-patch+json"}, body:JSON.stringify(ops) });
+    const tok = await getToken(cfg);
+    const base = getBase(cfg);
+    let res;
+    try {
+      res = await fetch(`${base}${path}`, {
+        method: "PATCH",
+        headers: { Authorization:`Bearer ${tok}`, "Content-Type":"application/json-patch+json" },
+        body: JSON.stringify(ops)
+      });
+    } catch(e) { throw new Error(CORS_HINT); }
     if (!res.ok) { const t=await res.text(); throw new Error(`PATCH ${res.status}: ${t}`); }
-    return res.status===204?null:res.json();
+    return res.status===204 ? null : res.json();
   };
 
   const testConnectivity = async () => {
     setConnectStatus("testing"); setConnectMsg("");
-    try { await getToken(configDraft); setConnectStatus("success"); setConnectMsg("Connected to ISC tenant successfully."); }
-    catch(e) { setConnectStatus("error"); setConnectMsg(e.message); }
+    const base = getBase(configDraft);
+    if (!base) { setConnectStatus("error"); setConnectMsg("No URL configured — enter your API Endpoint or Tenant URL."); return; }
+    if (!configDraft.clientId) { setConnectStatus("error"); setConnectMsg("Client ID is required."); return; }
+    if (!configDraft.clientSecret) { setConnectStatus("error"); setConnectMsg("Client Secret is required."); return; }
+    try {
+      await getToken(configDraft);
+      setConnectStatus("success");
+      setConnectMsg(`Connected successfully to ${base}`);
+    } catch(e) { setConnectStatus("error"); setConnectMsg(e.message); }
   };
 
   const loadIdentities = async () => {
@@ -1134,20 +1193,86 @@ function NonEmployeeHub() {
             <FG label="Contact email"><input style={inp(false)} type="email" value={configDraft.contactEmail} placeholder="admin@acme.com" onChange={e=>setConfigDraft(v=>({...v,contactEmail:e.target.value}))}/></FG>
           </div>
           <FG label="Notes"><textarea style={{...inp(false),height:"70px",resize:"vertical"}} value={configDraft.notes} placeholder="Optional notes" onChange={e=>setConfigDraft(v=>({...v,notes:e.target.value}))}/></FG>
+
           <div style={{borderTop:`1px solid ${T.sectionBorder}`,paddingTop:"1.25rem",marginTop:"0.5rem"}}>
             <div style={{...secHead,borderBottom:"none",paddingBottom:"0.75rem"}}>ISC tenant connection</div>
-            <FG label="Tenant URL" required hint="Used for the OAuth token endpoint"><input style={inp(false)} value={configDraft.tenantUrl} placeholder="https://tenant.identitynow.com" onChange={e=>setConfigDraft(v=>({...v,tenantUrl:e.target.value}))}/></FG>
-            <FG label="API endpoint" hint="Leave blank to use Tenant URL for API calls"><input style={inp(false)} value={configDraft.apiEndpoint} placeholder="https://tenant.api.identitynow.com" onChange={e=>setConfigDraft(v=>({...v,apiEndpoint:e.target.value}))}/></FG>
+
+            {/* URL priority guide */}
+            <div style={{background:T.infoBg,border:`1px solid ${T.infoBorder}`,borderRadius:"8px",padding:"0.85rem 1rem",marginBottom:"1rem",fontSize:`${fs-1}px`}}>
+              <div style={{fontWeight:"600",color:T.text,marginBottom:"6px"}}>URL setup guide</div>
+              <div style={{color:T.textMuted,lineHeight:"1.7"}}>
+                SailPoint ISC uses <strong style={{color:T.text}}>two different subdomains</strong>:
+                the UI lives at <code style={{background:T.attrBg,padding:"1px 5px",borderRadius:"3px",fontSize:`${fs-2}px`}}>org.identitynow.com</code> and
+                the API (including OAuth tokens) lives at <code style={{background:T.attrBg,padding:"1px 5px",borderRadius:"3px",fontSize:`${fs-2}px`}}>org.api.identitynow.com</code>.
+                Enter the <strong style={{color:T.text}}>API subdomain</strong> in the API Endpoint field below.
+                The Tenant URL field is only needed if your OAuth and API base URLs differ.
+              </div>
+              <div style={{marginTop:"8px",color:T.textMuted}}>
+                <strong style={{color:T.text}}>URL priority order:</strong> Proxy URL → API Endpoint → Tenant URL.
+                All three fields (OAuth token, REST API calls) use the same resolved base.
+              </div>
+            </div>
+
+            <FG label="API endpoint (primary — use this)" required hint="e.g. https://org.api.identitynow.com — used for OAuth token AND all API calls">
+              <input style={inp(false)} value={configDraft.apiEndpoint} placeholder="https://your-org.api.identitynow.com" onChange={e=>setConfigDraft(v=>({...v,apiEndpoint:e.target.value}))}/>
+            </FG>
+            <FG label="Tenant URL (fallback if API endpoint is blank)" hint="e.g. https://your-org.identitynow.com — only needed if different from API endpoint">
+              <input style={inp(false)} value={configDraft.tenantUrl} placeholder="https://your-org.identitynow.com" onChange={e=>setConfigDraft(v=>({...v,tenantUrl:e.target.value}))}/>
+            </FG>
             <div style={g2}>
               <FG label="Client ID" required><input style={inp(false)} value={configDraft.clientId} placeholder="OAuth client ID" onChange={e=>setConfigDraft(v=>({...v,clientId:e.target.value}))}/></FG>
               <FG label="Client secret" required><input style={inp(false)} type="password" value={configDraft.clientSecret} placeholder="OAuth client secret" onChange={e=>setConfigDraft(v=>({...v,clientSecret:e.target.value}))}/></FG>
             </div>
             <FG label="Non-employee source ID"><input style={inp(false)} value={configDraft.sourceId} placeholder="e.g. 2c918083880b9dff0188135036c5b4ba" onChange={e=>setConfigDraft(v=>({...v,sourceId:e.target.value}))}/></FG>
           </div>
-          <div style={{display:"flex",alignItems:"center",gap:"1rem",marginTop:"0.75rem",paddingTop:"1rem",borderTop:`1px solid ${T.sectionBorder}`}}>
+
+          {/* CORS proxy section */}
+          <div style={{borderTop:`1px solid ${T.sectionBorder}`,paddingTop:"1.25rem",marginTop:"0.5rem"}}>
+            <div style={{...secHead,borderBottom:"none",paddingBottom:"0.5rem"}}>🔀 CORS proxy (required for browser-deployed apps)</div>
+            <div style={{background:T.warnBg,border:`1px solid ${T.warnBorder}`,borderRadius:"8px",padding:"0.85rem 1rem",marginBottom:"1rem",fontSize:`${fs-1}px`,color:T.text}}>
+              <div style={{fontWeight:"600",marginBottom:"6px"}}>Why you get "Failed to fetch"</div>
+              Browsers enforce <strong>CORS</strong> (Cross-Origin Resource Sharing) — JavaScript running on
+              {" "}<code style={{background:T.attrBg,padding:"1px 5px",borderRadius:"3px",fontSize:`${fs-2}px`}}>yoursite.netlify.app</code> cannot
+              directly call <code style={{background:T.attrBg,padding:"1px 5px",borderRadius:"3px",fontSize:`${fs-2}px`}}>org.api.identitynow.com</code> unless
+              ISC explicitly permits it. You have two options:
+              <div style={{marginTop:"10px",display:"flex",flexDirection:"column",gap:"8px"}}>
+                <div><strong>Option A — Configure CORS in ISC:</strong> In ISC Admin Console → Security Settings → API Management, add your deployed domain to the allowed CORS origins list. No code changes needed.</div>
+                <div><strong>Option B — Netlify proxy (recommended):</strong> Add a <code style={{background:T.attrBg,padding:"1px 5px",borderRadius:"3px",fontSize:`${fs-2}px`}}>netlify.toml</code> to your deployment folder. The proxy forwards requests server-side, bypassing CORS entirely. Then enter <code style={{background:T.attrBg,padding:"1px 5px",borderRadius:"3px",fontSize:`${fs-2}px`}}>/isc</code> in the Proxy URL field below.</div>
+              </div>
+            </div>
+
+            <FG label="Proxy URL (optional — overrides API Endpoint for all calls)" hint='Enter "/isc" if using the netlify.toml proxy below. Leave blank to call ISC directly (requires CORS to be configured in ISC).'>
+              <input style={inp(false)} value={configDraft.proxyUrl} placeholder="/isc  (or leave blank for direct calls)" onChange={e=>setConfigDraft(v=>({...v,proxyUrl:e.target.value}))}/>
+            </FG>
+
+            {/* netlify.toml code block */}
+            <div style={{marginTop:"0.75rem"}}>
+              <div style={{fontSize:`${fs-1}px`,fontWeight:"600",color:T.textMuted,marginBottom:"6px"}}>
+                netlify.toml — add this file to your deployment folder alongside index.html and app.jsx:
+              </div>
+              <pre style={{background:T.codeBg,color:T.codeText,padding:"1rem",borderRadius:"8px",fontSize:"12px",margin:0,overflowX:"auto",whiteSpace:"pre"}}{...{}}>{`# netlify.toml
+# Replace YOUR-ORG with your actual SailPoint tenant subdomain.
+# This proxies all /isc/* requests server-side, bypassing browser CORS.
+
+[[redirects]]
+  from   = "/isc/*"
+  to     = "https://YOUR-ORG.api.identitynow.com/:splat"
+  status = 200
+  force  = true
+
+# After adding this file:
+#  1. Redeploy by dragging the folder to Netlify again
+#  2. Set "Proxy URL" above to:  /isc
+#  3. Set "API Endpoint" above to:  /isc  (same value)
+#  4. Leave "Tenant URL" blank
+#  5. Save configuration and test connectivity`}</pre>
+            </div>
+          </div>
+
+          <div style={{display:"flex",alignItems:"center",gap:"1rem",marginTop:"1.25rem",paddingTop:"1rem",borderTop:`1px solid ${T.sectionBorder}`}}>
             <button style={btnS(false)} onClick={testConnectivity} disabled={connectStatus==="testing"}>{connectStatus==="testing"?"Testing…":"Test connectivity"}</button>
-            {connectStatus==="success"&&<span style={{color:T.connectOk,fontSize:`${fs-1}px`}}>● {connectMsg}</span>}
-            {connectStatus==="error"  &&<span style={{color:T.connectErr,fontSize:`${fs-2}px`,maxWidth:"400px"}}>{connectMsg}</span>}
+            {connectStatus==="success"&&<span style={{color:T.connectOk,fontSize:`${fs-1}px`,fontWeight:"500"}}>✓ {connectMsg}</span>}
+            {connectStatus==="error"  &&<div style={{color:T.connectErr,fontSize:`${fs-2}px`,maxWidth:"500px",lineHeight:"1.6"}}>{connectMsg}</div>}
           </div>
         </div>
       )}
