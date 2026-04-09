@@ -121,7 +121,16 @@ async function handleValidate(tenantUrl, clientId, clientSecret) {
   }
 
   const tok = tokenData.access_token;
-  const h   = { Authorization: `Bearer ${tok}`, "Content-Type": "application/json" };
+
+  // X-SailPoint-Experimental: true is required for any v2026 endpoint that is
+  // still in experimental/preview status. Including it on public endpoints is
+  // harmless. Omitting it on experimental endpoints causes a 400/403 error with
+  // a message saying the header is required — which is why counts were blank.
+  const h = {
+    Authorization:            `Bearer ${tok}`,
+    "Content-Type":           "application/json",
+    "X-SailPoint-Experimental": "true",
+  };
 
   const steps = [
     mk("connectivity", "DNS & TLS reachability", "pass", `${apiBase} reachable`),
@@ -130,89 +139,104 @@ async function handleValidate(tenantUrl, clientId, clientSecret) {
     mk("auth",         "OAuth2 authentication",   "pass", "client_credentials token issued"),
   ];
 
-  // ── Step 5: Org config ──  GET /v2026/org-config ─────────────────────────
-  // Returns: { orgName, pod, region, ... }
+  // ── Step 5: Org config ── GET /v2026/org-config ───────────────────────────
+  // Scope required: idn:org-config:read
+  // Key response fields: orgName, pod, timeZone, loginUrl, landingPage
   let orgData = {};
   try {
     const r    = await fetch(`${apiBase}/v2026/org-config`, { headers: h });
     const body = await readBody(r);
     if (r.ok) {
       orgData = tryJson(body, {});
+      // pod field is the data-centre pod identifier (e.g. "cook", "stg01-useast1")
       const pod = orgData.pod || orgData.region || "unknown";
       steps.push(mk("org", "Org configuration", "pass",
         `Org: ${orgData.orgName || "unknown"} | Pod: ${pod}`));
-    } else if (r.status === 403 || r.status === 401) {
-      steps.push(mk("org", "Org configuration", "warn",
-        `HTTP ${r.status} — idn:org-config:read scope required. ` +
-        `Org name inferred from URL: ${apiBase.split(".")[0].replace("https://","")}`));
     } else {
-      steps.push(mk("org", "Org configuration", "warn", `HTTP ${r.status} from /v2026/org-config`));
+      // Show raw body snippet so we can diagnose scope / experimental errors
+      const snippet = body.slice(0, 180).replace(/\n/g, " ");
+      const label   = (r.status === 403 || r.status === 401)
+        ? `HTTP ${r.status} — ensure idn:org-config:read scope is granted`
+        : `HTTP ${r.status} — ${snippet}`;
+      steps.push(mk("org", "Org configuration", "warn", label));
+      // Infer org name from the API base URL as a fallback
+      orgData.orgName = apiBase.replace("https://","").split(".")[0];
     }
   } catch (e) {
     steps.push(mk("org", "Org configuration", "warn", e.message));
   }
 
-  // ── Step 6: Identity count ── GET /v2026/identities?count=true&limit=1 ───
-  // Total count is returned in the X-Total-Count response header when count=true.
+  // ── Step 6: Identity count ── GET /v2026/identities?count=true&limit=1 ────
+  // Scope required: idn:identity:read
+  // Total count returned in X-Total-Count response header when count=true is set.
   let identityCount = 0;
   try {
     const r    = await fetch(`${apiBase}/v2026/identities?count=true&limit=1`, { headers: h });
     const body = await readBody(r);
     if (r.ok) {
       const xTotal = r.headers.get("X-Total-Count");
-      if (xTotal !== null) {
+      if (xTotal !== null && xTotal !== "") {
         identityCount = parseInt(xTotal, 10);
+        if (isNaN(identityCount)) identityCount = 0;
         steps.push(mk("identities", "Identity count", "pass",
-          `${identityCount.toLocaleString()} identities (X-Total-Count header)`));
+          `${identityCount.toLocaleString()} identities`));
       } else {
-        // Header absent — fall back to counting the returned array
+        // X-Total-Count header absent — count the returned page as a floor
         const arr = tryJson(body, []);
         identityCount = Array.isArray(arr) ? arr.length : 0;
         steps.push(mk("identities", "Identity count", "warn",
-          `X-Total-Count header absent — sample size: ${identityCount} (idn:identity:read scope may be needed for count)`));
+          `${identityCount} returned (X-Total-Count header missing — add idn:identity:read scope and count=true permission)`));
       }
-    } else if (r.status === 403 || r.status === 401) {
-      steps.push(mk("identities", "Identity count", "warn",
-        `HTTP ${r.status} — idn:identity:read scope required`));
     } else {
-      steps.push(mk("identities", "Identity count", "warn",
-        `HTTP ${r.status} from /v2026/identities`));
+      const snippet = body.slice(0, 180).replace(/\n/g, " ");
+      const label   = (r.status === 403 || r.status === 401)
+        ? `HTTP ${r.status} — ensure idn:identity:read scope is granted`
+        : `HTTP ${r.status} — ${snippet}`;
+      steps.push(mk("identities", "Identity count", "warn", label));
     }
   } catch (e) {
     steps.push(mk("identities", "Identity count", "warn", e.message));
   }
 
-  // ── Step 7: VA clusters ── GET /v2026/managed-clusters ───────────────────
-  // Each cluster has: { id, name, status, ... }
-  // Healthy statuses: "CONNECTED" | "HEALTHY"
-  // Degraded: "DISCONNECTED" | "DEGRADED" | "WARNING" | anything else
+  // ── Step 7: VA clusters ── GET /v2026/managed-clusters ────────────────────
+  // Scope required: idn:managed-cluster:read  (+ X-SailPoint-Experimental: true)
+  // Response: array of ManagedCluster objects
+  // Status field: clientStatus.status  (nested — NOT top-level .status)
+  //   clientStatus.status values: CONNECTED, DISCONNECTED, CONFIGURING, WARNING, ERROR
+  // Also check top-level .status as some versions use it directly
   let vaCount = 0, vaUnhealthy = 0, vaClusters = [];
   try {
     const r    = await fetch(`${apiBase}/v2026/managed-clusters`, { headers: h });
     const body = await readBody(r);
     if (r.ok) {
-      const data  = tryJson(body, []);
-      vaClusters  = Array.isArray(data) ? data : [];
-      vaCount     = vaClusters.length;
-      vaUnhealthy = vaClusters.filter(
-        c => !["CONNECTED", "HEALTHY"].includes((c.status || "").toUpperCase())
-      ).length;
+      const data = tryJson(body, []);
+      vaClusters = Array.isArray(data) ? data : [];
+      vaCount    = vaClusters.length;
+
+      // Determine health: clientStatus.status is the authoritative field in v2026.
+      // Fall back to top-level .status if clientStatus is absent (older schemas).
+      const HEALTHY_STATUSES = ["CONNECTED", "HEALTHY", "CONFIGURED"];
+      vaUnhealthy = vaClusters.filter(c => {
+        const s = (
+          (c.clientStatus && c.clientStatus.status) ||
+          c.status || ""
+        ).toUpperCase();
+        return !HEALTHY_STATUSES.includes(s);
+      }).length;
+
       if (vaCount === 0) {
         steps.push(mk("va", "VA cluster health", "warn",
-          "No managed clusters found (may be expected for this tenant)"));
-      } else if (vaUnhealthy === 0) {
-        steps.push(mk("va", "VA cluster health", "pass",
-          `${vaCount} cluster${vaCount !== 1 ? "s" : ""} — all healthy`));
+          "No managed clusters found (may be expected for cloud-only tenants)"));
       } else {
-        steps.push(mk("va", "VA cluster health", "warn",
-          `${vaCount} cluster${vaCount !== 1 ? "s" : ""} — ${vaUnhealthy} unhealthy`));
+        steps.push(mk("va", "VA cluster health", vaUnhealthy === 0 ? "pass" : "warn",
+          `${vaCount} cluster${vaCount !== 1 ? "s" : ""} · ${vaUnhealthy} unhealthy`));
       }
-    } else if (r.status === 403 || r.status === 401) {
-      steps.push(mk("va", "VA cluster health", "warn",
-        `HTTP ${r.status} — idn:managed-cluster:read scope required`));
     } else {
-      steps.push(mk("va", "VA cluster health", "warn",
-        `HTTP ${r.status} from /v2026/managed-clusters`));
+      const snippet = body.slice(0, 180).replace(/\n/g, " ");
+      const label   = (r.status === 403 || r.status === 401)
+        ? `HTTP ${r.status} — ensure idn:managed-cluster:read scope is granted`
+        : `HTTP ${r.status} — ${snippet}`;
+      steps.push(mk("va", "VA cluster health", "warn", label));
     }
   } catch (e) {
     steps.push(mk("va", "VA cluster health", "warn", e.message));
@@ -287,7 +311,11 @@ exports.handler = async (event) => {
       try {
         r = await fetch(`${apiBase}${path}`, {
           method,
-          headers: { Authorization: `Bearer ${tok}`, "Content-Type": "application/json" },
+          headers: {
+            Authorization:              `Bearer ${tok}`,
+            "Content-Type":             "application/json",
+            "X-SailPoint-Experimental": "true",
+          },
           body: (method !== "GET" && method !== "HEAD" && requestBody !== undefined)
                 ? JSON.stringify(requestBody) : undefined,
         });
