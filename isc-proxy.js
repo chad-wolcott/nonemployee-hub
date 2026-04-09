@@ -49,7 +49,9 @@ async function fetchToken(apiBase, clientId, clientSecret) {
               : `OAuth ${res.status}: ${txt.slice(0,300)}`;
     throw new Error(msg);
   }
-  return res.json(); // { access_token, expires_in, token_type }
+  const raw = await res.text();
+  try { return JSON.parse(raw); }
+  catch { throw new Error(`OAuth response not valid JSON: ${raw.slice(0,200)}`); }
 }
 
 // ── action: validate — run a full 7-step connectivity test ───────────────────
@@ -94,8 +96,9 @@ async function handleValidate(tenantUrl, clientId, clientSecret) {
   let orgData = {};
   try {
     const r = await fetch(`${apiBase}/v3/org-config`, { headers:h });
+    const raw5 = await r.text();
     if (r.ok) {
-      orgData = await r.json();
+      try { orgData = JSON.parse(raw5); } catch {}
       steps.push(mk("org","Org Configuration","pass",
         `Org: ${orgData.orgName||"unknown"} | Pod: ${orgData.pod||"unknown"}`));
     } else {
@@ -107,11 +110,13 @@ async function handleValidate(tenantUrl, clientId, clientSecret) {
   let identityCount = 0;
   try {
     const r = await fetch(`${apiBase}/v3/identities?count=true&limit=1`, { headers:h });
-    const xc = r.headers.get("X-Total-Count");
+    const xc   = r.headers.get("X-Total-Count");
+    const raw6 = await r.text();
     if (xc) {
       identityCount = parseInt(xc, 10);
       steps.push(mk("identities","Identity Data Access","pass",`${identityCount.toLocaleString()} identities`));
     } else if (r.ok) {
+      try { const d6 = JSON.parse(raw6); identityCount = Array.isArray(d6) ? d6.length : 0; } catch {}
       steps.push(mk("identities","Identity Data Access","pass","Identities endpoint accessible"));
     } else {
       steps.push(mk("identities","Identity Data Access","warn",`HTTP ${r.status} — check identity:read scope`));
@@ -122,9 +127,9 @@ async function handleValidate(tenantUrl, clientId, clientSecret) {
   let vaCount=0, vaUnhealthy=0, vaClusters=[];
   try {
     const r = await fetch(`${apiBase}/beta/managed-clusters`, { headers:h });
+    const raw7 = await r.text();
     if (r.ok) {
-      const d = await r.json();
-      vaClusters  = Array.isArray(d) ? d : [];
+      try { const d = JSON.parse(raw7); vaClusters = Array.isArray(d) ? d : []; } catch {}
       vaCount     = vaClusters.length;
       vaUnhealthy = vaClusters.filter(v=>!["CONNECTED","HEALTHY"].includes(v.status)).length;
       steps.push(mk("va","VA Clusters", vaCount>0?"pass":"warn",
@@ -206,8 +211,10 @@ exports.handler = async (event) => {
       });
 
       if (r.status === 204) return { statusCode:204, headers:CORS, body:"" };
+      const raw = await r.text();          // read body stream exactly once
       let data;
-      try { data = await r.json(); } catch { data = { raw: await r.text() }; }
+      try { data = JSON.parse(raw); }      // attempt JSON parse on the string
+      catch { data = { raw }; }            // not JSON — return raw text as field
       return { statusCode:r.status, headers:CORS, body:JSON.stringify(data) };
     }
 
