@@ -1,352 +1,488 @@
 // netlify/functions/isc-proxy.js
 // ─────────────────────────────────────────────────────────────────────────────
-// Server-side proxy for SailPoint ISC API calls from the Non-Employee Hub.
-// Runs in Node.js on Netlify — no browser CORS restrictions apply here.
+// RSM Non-Employee Hub — SailPoint ISC Server-Side Proxy
 //
-// Correct v2026 endpoints used throughout:
-//   Org config  → GET /v2026/org-config
-//   Identities  → GET /v2026/identities?count=true&limit=1  (X-Total-Count header)
-//   VA clusters → GET /v2026/managed-clusters
+// Proxies all ISC API calls server-side to bypass browser CORS restrictions.
+// Core logic ported directly from the working MIH sailpoint-proxy.js.
 //
-// Actions accepted (POST body):
-//   { action: "ping" }
-//   { action: "token",    tenantUrl, clientId, clientSecret }
-//   { action: "api",      apiBase, bearerToken, method, path, requestBody? }
-//   { action: "validate", tenantUrl, clientId, clientSecret }
+// Supported actions (POST body):
+//   ping             → availability check
+//   token            → OAuth2 client_credentials exchange, returns token to client
+//   api              → forward a signed REST call using a cached bearer token
+//   validate         → full 7-step connectivity + data retrieval
 // ─────────────────────────────────────────────────────────────────────────────
 
+const https = require('https')
+const http  = require('http')
+
+// ── CORS headers ──────────────────────────────────────────────────────────────
 const CORS = {
-  "Access-Control-Allow-Origin":  "*",
-  "Access-Control-Allow-Headers": "Content-Type",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
-  "Content-Type":                 "application/json",
-};
+  'Access-Control-Allow-Origin':  '*',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  'Content-Type':                 'application/json',
+}
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Low-level HTTP helper (uses Node.js https/http — more reliable than fetch
+//    for reading raw response headers like X-Total-Count) ─────────────────────
+function httpRequest(url, options = {}) {
+  return new Promise((resolve, reject) => {
+    const parsed  = new URL(url)
+    const lib     = parsed.protocol === 'https:' ? https : http
+    const timeout = options.timeout || 12000
 
-// Convert tenant UI URL → API base URL
-// https://org.identitynow.com → https://org.api.identitynow.com
-function deriveApiBase(url) {
-  if (!url) return "";
+    const reqOptions = {
+      hostname: parsed.hostname,
+      port:     parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
+      path:     parsed.pathname + parsed.search,
+      method:   options.method || 'GET',
+      headers:  options.headers || {},
+      timeout,
+    }
+
+    const req = lib.request(reqOptions, (res) => {
+      let data = ''
+      res.on('data', chunk => { data += chunk })
+      res.on('end',  () => resolve({ status: res.statusCode, headers: res.headers, body: data }))
+    })
+
+    req.on('timeout', () => { req.destroy(); reject(new Error('Request timed out')) })
+    req.on('error',   (err) => reject(err))
+
+    if (options.body) req.write(options.body)
+    req.end()
+  })
+}
+
+// ── Derive API base URL from tenant URL ───────────────────────────────────────
+// https://acme.identitynow.com      → https://acme.api.identitynow.com
+// https://acme.identitynow-demo.com → https://acme.api.identitynow-demo.com
+// *.rsm.security                    → same origin (vanity/reverse-proxy)
+function getApiBase(tenantUrl) {
   try {
-    const host = new URL(url).hostname;
-    if (host.endsWith(".identitynow.com"))
-      return `https://${host.replace(".identitynow.com", "")}.api.identitynow.com`;
-    if (host.endsWith(".identitynow-demo.com"))
-      return `https://${host.replace(".identitynow-demo.com", "")}.api.identitynow-demo.com`;
-  } catch {}
-  return url.replace(/\/+$/, "");
+    const u    = new URL(tenantUrl)
+    const host = u.hostname
+    const org  = host.split('.')[0]
+    if (host.endsWith('.identitynow.com'))
+      return `https://${org}.api.identitynow.com`
+    if (host.endsWith('.identitynow-demo.com'))
+      return `https://${org}.api.identitynow-demo.com`
+    return `https://${host}`   // vanity URL — API on same origin
+  } catch {
+    throw new Error(`Invalid tenant URL: ${tenantUrl}`)
+  }
 }
 
-// Normalise the API base — if the caller already passed an .api. URL leave it,
-// otherwise derive it. Always strip trailing slashes.
-function resolveApiBase(tenantUrl) {
-  const clean = (tenantUrl || "").replace(/\/+$/, "");
-  if (clean.includes(".api.")) return clean;
-  return deriveApiBase(clean);
-}
+// ── OAuth2 token acquisition ──────────────────────────────────────────────────
+async function getToken(tenantUrl, clientId, clientSecret) {
+  const apiBase    = getApiBase(tenantUrl)
+  const bodyParams = `grant_type=client_credentials&client_id=${encodeURIComponent(clientId)}&client_secret=${encodeURIComponent(clientSecret)}`
 
-// Read a Response body safely as text (stream can only be consumed once)
-async function readBody(res) {
-  try { return await res.text(); } catch { return ""; }
-}
+  const res = await httpRequest(`${apiBase}/oauth/token`, {
+    method:  'POST',
+    headers: {
+      'Content-Type':   'application/x-www-form-urlencoded',
+      'Content-Length': Buffer.byteLength(bodyParams).toString(),
+    },
+    body: bodyParams,
+  })
 
-// Parse text to JSON, return fallback on failure
-function tryJson(text, fallback = {}) {
-  try { return JSON.parse(text); } catch { return fallback; }
-}
-
-// Fetch an OAuth2 client_credentials token and return the full token object
-async function fetchToken(apiBase, clientId, clientSecret) {
-  let res;
-  try {
-    res = await fetch(`${apiBase}/oauth/token`, {
-      method:  "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type:    "client_credentials",
-        client_id:     clientId,
-        client_secret: clientSecret,
-      }).toString(),
-    });
-  } catch (e) {
-    throw new Error(`Cannot reach ${apiBase}/oauth/token — ${e.message}`);
+  if (res.status !== 200) {
+    let detail = ''
+    try { detail = JSON.parse(res.body)?.error_description || '' } catch {}
+    throw new Error(`Token request failed (HTTP ${res.status})${detail ? ': ' + detail : ''}`)
   }
 
-  const body = await readBody(res);
-  if (!res.ok) {
-    const msg =
-      res.status === 401 ? `Invalid Client ID or Client Secret (401) — ${body.slice(0, 200)}`
-    : res.status === 400 ? `Bad OAuth request (400) — ${body.slice(0, 200)}`
-    : `OAuth error ${res.status} — ${body.slice(0, 300)}`;
-    throw new Error(msg);
-  }
-
-  const data = tryJson(body);
-  if (!data.access_token) {
-    throw new Error(`OAuth response missing access_token — ${body.slice(0, 200)}`);
-  }
-  return data; // { access_token, expires_in, token_type }
+  const token = JSON.parse(res.body)
+  return { accessToken: token.access_token, expiresIn: token.expires_in, tokenType: token.token_type }
 }
 
-// ── Step helpers ──────────────────────────────────────────────────────────────
-const mk = (id, label, status, detail = "") => ({ id, label, status, detail });
+// ── Org info ── /v3/org-config with beta fallback ─────────────────────────────
+async function getOrgInfo(tenantUrl, accessToken) {
+  const apiBase = getApiBase(tenantUrl)
 
-// ── Full connectivity validation ──────────────────────────────────────────────
-async function handleValidate(tenantUrl, clientId, clientSecret) {
-  const apiBase = resolveApiBase(tenantUrl);
+  // Primary: v3 org-config (stable, no experimental header needed)
+  const res = await httpRequest(`${apiBase}/v3/org-config`, {
+    headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
+  })
 
-  // ── Steps 1–4: OAuth token acquisition covers DNS + TLS + auth ───────────
-  let tokenData;
-  try {
-    tokenData = await fetchToken(apiBase, clientId, clientSecret);
-  } catch (e) {
-    const msg     = e.message;
-    const isConn  = /reach|ENOTFOUND|ECONNREFUSED|ETIMEDOUT|network|fetch/i.test(msg);
-    const isTls   = /SSL|TLS|cert/i.test(msg);
-    const isAuth  = /401|400|Invalid Client|Bad OAuth/i.test(msg);
+  if (res.status === 200) {
+    const data = JSON.parse(res.body)
     return {
-      success: false,
-      error:   msg,
-      steps: [
-        mk("connectivity", "DNS & TLS reachability",  isConn ? "fail" : "pass",  isConn ? msg : `${apiBase} reachable`),
-        mk("tls",          "TLS certificate valid",    isTls  ? "fail" : (isConn ? "pending" : "pass"), isTls ? msg : "TLS OK"),
-        mk("api",          "API endpoint reachable",   (isConn || isTls) ? "pending" : "pass", `${apiBase}/oauth/token`),
-        mk("auth",         "OAuth2 authentication",    isAuth ? "fail" : "pending", isAuth ? msg : ""),
-        mk("org",          "Org configuration",        "pending", ""),
-        mk("identities",   "Identity count",           "pending", ""),
-        mk("va",           "VA cluster health",        "pending", ""),
-      ],
-    };
-  }
-
-  const tok = tokenData.access_token;
-
-  // X-SailPoint-Experimental: true is required for any v2026 endpoint that is
-  // still in experimental/preview status. Including it on public endpoints is
-  // harmless. Omitting it on experimental endpoints causes a 400/403 error with
-  // a message saying the header is required — which is why counts were blank.
-  const h = {
-    Authorization:            `Bearer ${tok}`,
-    "Content-Type":           "application/json",
-    "X-SailPoint-Experimental": "true",
-  };
-
-  const steps = [
-    mk("connectivity", "DNS & TLS reachability", "pass", `${apiBase} reachable`),
-    mk("tls",          "TLS certificate valid",   "pass", "TLS handshake successful"),
-    mk("api",          "API endpoint reachable",  "pass", `${apiBase}/oauth/token responding`),
-    mk("auth",         "OAuth2 authentication",   "pass", "client_credentials token issued"),
-  ];
-
-  // ── Step 5: Org config ── GET /v2026/org-config ───────────────────────────
-  // Scope required: idn:org-config:read
-  // Key response fields: orgName, pod, timeZone, loginUrl, landingPage
-  let orgData = {};
-  try {
-    const r    = await fetch(`${apiBase}/v2026/org-config`, { headers: h });
-    const body = await readBody(r);
-    if (r.ok) {
-      orgData = tryJson(body, {});
-      // pod field is the data-centre pod identifier (e.g. "cook", "stg01-useast1")
-      const pod = orgData.pod || orgData.region || "unknown";
-      steps.push(mk("org", "Org configuration", "pass",
-        `Org: ${orgData.orgName || "unknown"} | Pod: ${pod}`));
-    } else {
-      // Show raw body snippet so we can diagnose scope / experimental errors
-      const snippet = body.slice(0, 180).replace(/\n/g, " ");
-      const label   = (r.status === 403 || r.status === 401)
-        ? `HTTP ${r.status} — ensure idn:org-config:read scope is granted`
-        : `HTTP ${r.status} — ${snippet}`;
-      steps.push(mk("org", "Org configuration", "warn", label));
-      // Infer org name from the API base URL as a fallback
-      orgData.orgName = apiBase.replace("https://","").split(".")[0];
+      orgName: data.orgName || data.name,
+      pod:     data.pod,
+      region:  data.region,
     }
-  } catch (e) {
-    steps.push(mk("org", "Org configuration", "warn", e.message));
   }
 
-  // ── Step 6: Identity count ── GET /v2026/identities?count=true&limit=1 ────
-  // Scope required: idn:identity:read
-  // Total count returned in X-Total-Count response header when count=true is set.
-  let identityCount = 0;
-  try {
-    const r    = await fetch(`${apiBase}/v2026/identities?count=true&limit=1`, { headers: h });
-    const body = await readBody(r);
-    if (r.ok) {
-      const xTotal = r.headers.get("X-Total-Count");
-      if (xTotal !== null && xTotal !== "") {
-        identityCount = parseInt(xTotal, 10);
-        if (isNaN(identityCount)) identityCount = 0;
-        steps.push(mk("identities", "Identity count", "pass",
-          `${identityCount.toLocaleString()} identities`));
-      } else {
-        // X-Total-Count header absent — count the returned page as a floor
-        const arr = tryJson(body, []);
-        identityCount = Array.isArray(arr) ? arr.length : 0;
-        steps.push(mk("identities", "Identity count", "warn",
-          `${identityCount} returned (X-Total-Count header missing — add idn:identity:read scope and count=true permission)`));
+  // Fallback: beta tenant-config
+  const res2 = await httpRequest(`${apiBase}/beta/tenant-config/product`, {
+    headers: { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' },
+  })
+  if (res2.status === 200) {
+    const data = JSON.parse(res2.body)
+    return { orgName: data.name || data.displayName, pod: data.pod }
+  }
+
+  return { orgName: null, pod: null }
+}
+
+// ── Identity count ── /v2025/identities with X-SailPoint-Experimental header ─
+// Reads X-Total-Count response header (Node.js normalises headers to lowercase).
+// Falls back to POST /v3/search/count if the v2025 endpoint is restricted.
+async function getIdentityCount(tenantUrl, accessToken) {
+  const apiBase = getApiBase(tenantUrl)
+
+  // Primary: v2025 identities list with count=true
+  const res = await httpRequest(`${apiBase}/v2025/identities?limit=1&count=true`, {
+    headers: {
+      Authorization:              `Bearer ${accessToken}`,
+      Accept:                     'application/json',
+      'X-SailPoint-Experimental': 'true',
+    },
+  })
+
+  if (res.status === 200) {
+    // Node.js http module lowercases all header names
+    const count = parseInt(res.headers['x-total-count'] || '0', 10)
+    return { count, source: 'v2025-identities' }
+  }
+
+  // Fallback: v3 search/count (no experimental header, no scope restriction)
+  const countBody = JSON.stringify({ indices: ['identities'], query: { query: '*' } })
+  const res2 = await httpRequest(`${apiBase}/v3/search/count`, {
+    method:  'POST',
+    headers: {
+      Authorization:    `Bearer ${accessToken}`,
+      Accept:           'application/json',
+      'Content-Type':  'application/json',
+      'Content-Length': Buffer.byteLength(countBody).toString(),
+    },
+    body: countBody,
+  })
+
+  if (res2.status === 204 || res2.status === 200) {
+    const count = parseInt(res2.headers['x-total-count'] || '0', 10)
+    return { count, source: 'search-count' }
+  }
+
+  throw new Error(`Identity count failed — v2025 HTTP ${res.status}, search/count HTTP ${res2.status}`)
+}
+
+// ── VA clusters ── multi-strategy approach ────────────────────────────────────
+//
+// Strategy 1: GET /v2026/managed-clusters → /v3/managed-clusters
+//   v3 shape:  clientStatus.status === 'NORMAL' means healthy
+//   v2026 shape: health.healthy (bool) or health.status, or clientStatus.status
+//
+// Strategy 2: GET /v2026/managed-clients (individual VA nodes, grouped by cluster)
+//   clientStatus.status === 'NORMAL' = healthy node; anything else = unhealthy
+async function getVaClusters(tenantUrl, accessToken) {
+  const apiBase = getApiBase(tenantUrl)
+  const headers = { Authorization: `Bearer ${accessToken}`, Accept: 'application/json' }
+
+  // Helper: extract a normalised status string from any cluster object shape
+  function clusterStatus(c) {
+    // v3 / v2025 shape: clientStatus.status — 'NORMAL' is healthy
+    if (c.clientStatus?.status) {
+      const s = c.clientStatus.status.toUpperCase()
+      return s === 'NORMAL' ? 'CONNECTED' : s
+    }
+    // v2026 shape: health object
+    if (c.health !== undefined) {
+      if (typeof c.health.healthy === 'boolean')
+        return c.health.healthy ? 'CONNECTED' : (c.health.status || 'UNHEALTHY')
+      if (c.health.status) {
+        const s = c.health.status.toUpperCase()
+        return ['HEALTHY', 'OK', 'SUCCEEDED', 'NORMAL'].includes(s) ? 'CONNECTED' : s
       }
-    } else {
-      const snippet = body.slice(0, 180).replace(/\n/g, " ");
-      const label   = (r.status === 403 || r.status === 401)
-        ? `HTTP ${r.status} — ensure idn:identity:read scope is granted`
-        : `HTTP ${r.status} — ${snippet}`;
-      steps.push(mk("identities", "Identity count", "warn", label));
     }
-  } catch (e) {
-    steps.push(mk("identities", "Identity count", "warn", e.message));
+    // Top-level status string
+    if (c.status) {
+      const s = c.status.toUpperCase()
+      return ['HEALTHY', 'NORMAL', 'ACTIVE', 'CONNECTED', 'OK'].includes(s) ? 'CONNECTED' : s
+    }
+    return 'CONNECTED'  // unknown — assume healthy
   }
 
-  // ── Step 7: VA clusters ── GET /v2026/managed-clusters ────────────────────
-  // Scope required: idn:managed-cluster:read  (+ X-SailPoint-Experimental: true)
-  // Response: array of ManagedCluster objects
-  // Status field: clientStatus.status  (nested — NOT top-level .status)
-  //   clientStatus.status values: CONNECTED, DISCONNECTED, CONFIGURING, WARNING, ERROR
-  // Also check top-level .status as some versions use it directly
-  let vaCount = 0, vaUnhealthy = 0, vaClusters = [];
+  // Helper: cluster type name (string in v3, object reference in v2026)
+  function clusterTypeName(c) {
+    if (!c.type) return ''
+    if (typeof c.type === 'string') return c.type.toUpperCase()
+    if (typeof c.type === 'object') return (c.type.name || c.type.clusterType || '').toUpperCase()
+    return ''
+  }
+
+  // Helper: is this a VA cluster? Include if type is VA or unset (exclude CCG/SAAS/PROXY)
+  function isVaCluster(c) {
+    const t = clusterTypeName(c)
+    if (!t) return true
+    if (t === 'VA') return true
+    return !['CCG', 'SAAS', 'PROXY'].includes(t)
+  }
+
+  // Strategy 1 — managed-clusters list (try v2026 first, then v3)
+  for (const version of ['v2026', 'v3']) {
+    let res
+    try {
+      res = await httpRequest(`${apiBase}/${version}/managed-clusters`, { headers, timeout: 12000 })
+    } catch (err) {
+      console.warn(`[getVaClusters] ${version}/managed-clusters request error: ${err.message}`)
+      continue
+    }
+
+    console.log(`[getVaClusters] ${version}/managed-clusters → HTTP ${res.status}`)
+    if (res.status !== 200) {
+      console.warn(`[getVaClusters] ${version} error body: ${res.body.slice(0, 300)}`)
+      continue
+    }
+
+    let allClusters
+    try { allClusters = JSON.parse(res.body) } catch { continue }
+    if (!Array.isArray(allClusters)) { continue }
+
+    console.log(`[getVaClusters] ${version} returned ${allClusters.length} cluster(s)`)
+    if (allClusters.length > 0)
+      console.log('[getVaClusters] First cluster:', JSON.stringify(allClusters[0]).slice(0, 600))
+
+    const vaClusters = allClusters.filter(isVaCluster)
+
+    if (vaClusters.length > 0 || allClusters.length === 0) {
+      const enriched  = vaClusters.map(c => ({
+        id:     c.id,
+        name:   c.name || c.id,
+        type:   clusterTypeName(c) || 'VA',
+        status: clusterStatus(c),
+      }))
+      const unhealthy = enriched.filter(c => c.status !== 'CONNECTED').length
+      return { vaCount: enriched.length, unhealthyCount: unhealthy, clusters: enriched }
+    }
+
+    console.warn('[getVaClusters] Type filter excluded all clusters — falling back to managed-clients')
+    break
+  }
+
+  // Strategy 2 — managed-clients (individual VA nodes, grouped by clusterId)
+  console.log('[getVaClusters] Trying strategy 2: managed-clients')
   try {
-    const r    = await fetch(`${apiBase}/v2026/managed-clusters`, { headers: h });
-    const body = await readBody(r);
-    if (r.ok) {
-      const data = tryJson(body, []);
-      vaClusters = Array.isArray(data) ? data : [];
-      vaCount    = vaClusters.length;
+    const res = await httpRequest(`${apiBase}/v2026/managed-clients`, { headers, timeout: 12000 })
+    console.log(`[getVaClusters] managed-clients → HTTP ${res.status}`)
 
-      // Determine health: clientStatus.status is the authoritative field in v2026.
-      // Fall back to top-level .status if clientStatus is absent (older schemas).
-      const HEALTHY_STATUSES = ["CONNECTED", "HEALTHY", "CONFIGURED"];
-      vaUnhealthy = vaClusters.filter(c => {
-        const s = (
-          (c.clientStatus && c.clientStatus.status) ||
-          c.status || ""
-        ).toUpperCase();
-        return !HEALTHY_STATUSES.includes(s);
-      }).length;
+    if (res.status === 200) {
+      const clients = JSON.parse(res.body)
+      if (!Array.isArray(clients))
+        return { vaCount: 0, unhealthyCount: 0, clusters: [], note: 'managed-clients not an array' }
 
-      if (vaCount === 0) {
-        steps.push(mk("va", "VA cluster health", "warn",
-          "No managed clusters found (may be expected for cloud-only tenants)"));
-      } else {
-        steps.push(mk("va", "VA cluster health", vaUnhealthy === 0 ? "pass" : "warn",
-          `${vaCount} cluster${vaCount !== 1 ? "s" : ""} · ${vaUnhealthy} unhealthy`));
+      console.log(`[getVaClusters] ${clients.length} client(s) returned`)
+      if (clients.length > 0)
+        console.log('[getVaClusters] First client:', JSON.stringify(clients[0]).slice(0, 500))
+
+      const clusterMap = new Map()
+      for (const client of clients) {
+        const cid   = client.clusterId || client.cluster?.id || 'unknown'
+        const cname = client.clusterName || client.cluster?.name || cid
+        const isHealthy = (client.clientStatus?.status || '').toUpperCase() === 'NORMAL'
+
+        if (!clusterMap.has(cid))
+          clusterMap.set(cid, { id: cid, name: cname, totalClients: 0, unhealthyClients: 0 })
+
+        const entry = clusterMap.get(cid)
+        entry.totalClients++
+        if (!isHealthy) entry.unhealthyClients++
       }
-    } else {
-      const snippet = body.slice(0, 180).replace(/\n/g, " ");
-      const label   = (r.status === 403 || r.status === 401)
-        ? `HTTP ${r.status} — ensure idn:managed-cluster:read scope is granted`
-        : `HTTP ${r.status} — ${snippet}`;
-      steps.push(mk("va", "VA cluster health", "warn", label));
+
+      const clusters = Array.from(clusterMap.values()).map(c => ({
+        id:     c.id,
+        name:   c.name,
+        type:   'VA',
+        status: c.unhealthyClients === 0 ? 'CONNECTED' : `${c.unhealthyClients}/${c.totalClients} unhealthy`,
+      }))
+      const unhealthy = clusters.filter(c => c.status !== 'CONNECTED').length
+      return { vaCount: clusters.length, unhealthyCount: unhealthy, clusters }
     }
-  } catch (e) {
-    steps.push(mk("va", "VA cluster health", "warn", e.message));
+
+    console.warn(`[getVaClusters] managed-clients HTTP ${res.status}: ${res.body.slice(0, 300)}`)
+  } catch (err) {
+    console.warn(`[getVaClusters] managed-clients error: ${err.message}`)
   }
 
-  // ── Build tenantData ──────────────────────────────────────────────────────
-  const tenantData = {
-    orgName:       orgData.orgName || resolveApiBase(tenantUrl).split(".")[0].replace("https://", ""),
-    pod:           orgData.pod || orgData.region || "unknown",
-    identityCount,
-    vaCount,
-    vaUnhealthy,
-    vaClusters:    vaClusters.slice(0, 30).map(c => ({
-      id:     c.id,
-      name:   c.name,
-      status: c.status,
-    })),
-    simulated: false,
-  };
+  return { vaCount: 0, unhealthyCount: 0, clusters: [], note: 'Both strategies failed — check Netlify function logs' }
+}
 
-  return { success: true, steps, tenantData };
+// ── Full validation ── 7-step connectivity test ───────────────────────────────
+async function fullValidation(tenantUrl, clientId, clientSecret) {
+  const steps = []
+  let accessToken = null
+  const apiBase   = getApiBase(tenantUrl)
+
+  // Step 1: DNS + TLS reachability (HEAD to tenant URL)
+  const start = Date.now()
+  try {
+    const res = await httpRequest(tenantUrl, { method: 'HEAD', timeout: 8000 })
+    steps.push({
+      id: 'connectivity', label: 'DNS & TLS Reachability', status: res.status < 500 ? 'pass' : 'fail',
+      detail: `Reachable in ${Date.now() - start}ms — HTTP ${res.status}`,
+    })
+    if (res.status >= 500) return { success: false, steps, error: 'Tenant URL returned server error' }
+  } catch (err) {
+    steps.push({ id: 'connectivity', label: 'DNS & TLS Reachability', status: 'fail', detail: err.message })
+    return { success: false, steps, error: `Tenant URL is unreachable: ${err.message}` }
+  }
+
+  // Step 2: TLS (implicit from HTTPS success above)
+  steps.push({ id: 'tls', label: 'TLS Certificate Valid', status: 'pass', detail: `HTTPS established to ${apiBase}` })
+
+  // Step 3: API endpoint reachable (HEAD to /oauth/token)
+  try {
+    const res = await httpRequest(`${apiBase}/oauth/token`, { method: 'HEAD', timeout: 8000 })
+    steps.push({
+      id: 'api', label: 'API Endpoint Reachable', status: res.status < 500 ? 'pass' : 'fail',
+      detail: `${apiBase}/oauth/token → HTTP ${res.status}`,
+    })
+    if (res.status >= 500) return { success: false, steps, error: 'API endpoint returned server error' }
+  } catch (err) {
+    steps.push({ id: 'api', label: 'API Endpoint Reachable', status: 'fail', detail: err.message })
+    return { success: false, steps, error: 'API endpoint unreachable' }
+  }
+
+  // Step 4: OAuth token
+  try {
+    const tok   = await getToken(tenantUrl, clientId, clientSecret)
+    accessToken = tok.accessToken
+    steps.push({ id: 'auth', label: 'OAuth2 Authentication', status: 'pass', detail: `Token issued — expires in ${tok.expiresIn}s` })
+  } catch (err) {
+    steps.push({ id: 'auth', label: 'OAuth2 Authentication', status: 'fail', detail: err.message })
+    return { success: false, steps, error: `Authentication failed: ${err.message}` }
+  }
+
+  // Steps 5–7: data retrieval (non-fatal — warn on failure, don't abort)
+  let orgInfo = {}, identityCount = 0, vaInfo = {}
+
+  try {
+    orgInfo = await getOrgInfo(tenantUrl, accessToken)
+    steps.push({
+      id: 'org', label: 'Org Configuration', status: 'pass',
+      detail: orgInfo.orgName
+        ? `Org: ${orgInfo.orgName}${orgInfo.pod ? ' | Pod: ' + orgInfo.pod : ''}`
+        : 'Org info retrieved',
+    })
+  } catch (err) {
+    steps.push({ id: 'org', label: 'Org Configuration', status: 'warn', detail: `Non-fatal: ${err.message}` })
+  }
+
+  try {
+    const ic      = await getIdentityCount(tenantUrl, accessToken)
+    identityCount = ic.count
+    steps.push({ id: 'identities', label: 'Identity Count', status: 'pass', detail: `${identityCount.toLocaleString()} identities` })
+  } catch (err) {
+    steps.push({ id: 'identities', label: 'Identity Count', status: 'warn', detail: `Non-fatal: ${err.message}` })
+  }
+
+  try {
+    vaInfo = await getVaClusters(tenantUrl, accessToken)
+    steps.push({
+      id: 'va', label: 'VA Cluster Health', status: vaInfo.note ? 'warn' : 'pass',
+      detail: vaInfo.note
+        ? `VA check non-fatal: ${vaInfo.note}`
+        : `${vaInfo.vaCount} cluster${vaInfo.vaCount !== 1 ? 's' : ''}${vaInfo.unhealthyCount > 0 ? ` — ${vaInfo.unhealthyCount} unhealthy` : ' — all healthy'}`,
+    })
+  } catch (err) {
+    steps.push({ id: 'va', label: 'VA Cluster Health', status: 'warn', detail: `Non-fatal: ${err.message}` })
+  }
+
+  return {
+    success: true,
+    steps,
+    tenantData: {
+      orgName:       orgInfo.orgName,
+      pod:           orgInfo.pod,
+      identityCount,
+      vaCount:       vaInfo.vaCount       || 0,
+      vaUnhealthy:   vaInfo.unhealthyCount || 0,
+      vaClusters:    vaInfo.clusters       || [],
+      simulated:     false,
+    },
+  }
 }
 
 // ── Main handler ──────────────────────────────────────────────────────────────
 exports.handler = async (event) => {
-  if (event.httpMethod === "OPTIONS")
-    return { statusCode: 200, headers: CORS, body: "" };
+  if (event.httpMethod === 'OPTIONS')
+    return { statusCode: 200, headers: CORS, body: '' }
 
-  if (event.httpMethod !== "POST")
-    return { statusCode: 405, headers: CORS, body: JSON.stringify({ error: "Method not allowed" }) };
+  if (event.httpMethod !== 'POST')
+    return { statusCode: 405, headers: CORS, body: JSON.stringify({ error: 'Method not allowed' }) }
 
-  let body;
-  try { body = JSON.parse(event.body || "{}"); }
-  catch { return { statusCode: 400, headers: CORS, body: JSON.stringify({ error: "Invalid JSON body" }) }; }
+  let body
+  try { body = JSON.parse(event.body || '{}') }
+  catch { return { statusCode: 400, headers: CORS, body: JSON.stringify({ error: 'Invalid JSON body' }) } }
 
-  const { action, tenantUrl, clientId, clientSecret } = body;
+  const { action, tenantUrl, clientId, clientSecret } = body
 
   try {
+    // ── ping ──────────────────────────────────────────────────────────────────
+    if (action === 'ping')
+      return { statusCode: 200, headers: CORS, body: JSON.stringify({ ok: true }) }
 
-    // ── ping ─────────────────────────────────────────────────────────────────
-    if (action === "ping") {
-      return { statusCode: 200, headers: CORS, body: JSON.stringify({ ok: true }) };
-    }
-
-    // ── token ─────────────────────────────────────────────────────────────────
-    // Acquire an OAuth token server-side and return it to the client for caching.
-    if (action === "token") {
+    // ── token — fetch an OAuth token and return it to the client for caching ─
+    if (action === 'token') {
       if (!tenantUrl || !clientId || !clientSecret)
-        return { statusCode: 400, headers: CORS, body: JSON.stringify({ error: "tenantUrl, clientId and clientSecret are required" }) };
-      const apiBase   = resolveApiBase(tenantUrl);
-      const tokenData = await fetchToken(apiBase, clientId, clientSecret);
-      return { statusCode: 200, headers: CORS, body: JSON.stringify(tokenData) };
+        return { statusCode: 400, headers: CORS, body: JSON.stringify({ error: 'tenantUrl, clientId and clientSecret are required' }) }
+      const tok = await getToken(tenantUrl, clientId, clientSecret)
+      // Return the full token data so the client can cache it with expiry
+      return { statusCode: 200, headers: CORS, body: JSON.stringify({ access_token: tok.accessToken, expires_in: tok.expiresIn, token_type: tok.tokenType }) }
     }
 
-    // ── api ───────────────────────────────────────────────────────────────────
-    // Forward a signed REST call using a cached bearer token (or credentials).
-    if (action === "api") {
-      const { apiBase, bearerToken, method = "GET", path, requestBody } = body;
-      if (!apiBase || !path)
-        return { statusCode: 400, headers: CORS, body: JSON.stringify({ error: "apiBase and path are required" }) };
+    // ── api — forward a signed REST call using a cached bearer token ──────────
+    if (action === 'api') {
+      const { apiBase, bearerToken, method = 'GET', path, requestBody } = body
 
-      // Use the supplied token; if missing, fetch a fresh one
-      let tok = bearerToken;
+      if (!apiBase || !path)
+        return { statusCode: 400, headers: CORS, body: JSON.stringify({ error: 'apiBase and path are required' }) }
+
+      let tok = bearerToken
       if (!tok) {
         if (!clientId || !clientSecret)
-          return { statusCode: 400, headers: CORS, body: JSON.stringify({ error: "bearerToken or clientId+clientSecret required" }) };
-        const td = await fetchToken(apiBase, clientId, clientSecret);
-        tok = td.access_token;
+          return { statusCode: 400, headers: CORS, body: JSON.stringify({ error: 'bearerToken or clientId+clientSecret required' }) }
+        const td = await getToken(tenantUrl || apiBase, clientId, clientSecret)
+        tok = td.accessToken
       }
 
-      let r;
-      try {
-        r = await fetch(`${apiBase}${path}`, {
-          method,
-          headers: {
-            Authorization:              `Bearer ${tok}`,
-            "Content-Type":             "application/json",
-            "X-SailPoint-Experimental": "true",
-          },
-          body: (method !== "GET" && method !== "HEAD" && requestBody !== undefined)
-                ? JSON.stringify(requestBody) : undefined,
-        });
-      } catch (e) {
-        return { statusCode: 502, headers: CORS, body: JSON.stringify({ error: `Upstream fetch failed: ${e.message}` }) };
+      const reqHeaders = {
+        Authorization:              `Bearer ${tok}`,
+        Accept:                     'application/json',
+        'Content-Type':             'application/json',
+        'X-SailPoint-Experimental': 'true',
       }
+      const bodyStr = (method !== 'GET' && method !== 'HEAD' && requestBody !== undefined)
+        ? JSON.stringify(requestBody) : undefined
+      if (bodyStr) reqHeaders['Content-Length'] = Buffer.byteLength(bodyStr).toString()
 
-      if (r.status === 204) return { statusCode: 204, headers: CORS, body: "" };
+      const res = await httpRequest(`${apiBase}${path}`, { method, headers: reqHeaders, body: bodyStr })
 
-      const rawBody = await readBody(r);
-      const data    = tryJson(rawBody, { raw: rawBody });
+      if (res.status === 204) return { statusCode: 204, headers: CORS, body: '' }
 
-      // Forward X-Total-Count if present (needed by identity-count calls)
-      const totalCount = r.headers.get("X-Total-Count");
-      const respHeaders = { ...CORS };
-      if (totalCount !== null) respHeaders["X-Total-Count"] = totalCount;
+      // Forward X-Total-Count to client (needed for identity count calls)
+      const respHeaders = { ...CORS }
+      if (res.headers['x-total-count']) respHeaders['X-Total-Count'] = res.headers['x-total-count']
 
-      return { statusCode: r.status, headers: respHeaders, body: JSON.stringify(data) };
+      let data
+      try { data = JSON.parse(res.body) } catch { data = { raw: res.body } }
+      return { statusCode: res.status, headers: respHeaders, body: JSON.stringify(data) }
     }
 
-    // ── validate ──────────────────────────────────────────────────────────────
-    if (action === "validate") {
+    // ── validate — full 7-step connectivity test ───────────────────────────────
+    if (action === 'validate') {
       if (!tenantUrl || !clientId || !clientSecret)
-        return { statusCode: 400, headers: CORS, body: JSON.stringify({ error: "tenantUrl, clientId and clientSecret are required" }) };
-      const result = await handleValidate(tenantUrl, clientId, clientSecret);
-      return { statusCode: 200, headers: CORS, body: JSON.stringify(result) };
+        return { statusCode: 400, headers: CORS, body: JSON.stringify({ error: 'tenantUrl, clientId and clientSecret are required' }) }
+      const result = await fullValidation(tenantUrl, clientId, clientSecret)
+      return { statusCode: 200, headers: CORS, body: JSON.stringify(result) }
     }
 
-    return { statusCode: 400, headers: CORS, body: JSON.stringify({ error: `Unknown action: ${action}` }) };
+    return { statusCode: 400, headers: CORS, body: JSON.stringify({ error: `Unknown action: ${action}` }) }
 
   } catch (err) {
-    return { statusCode: 500, headers: CORS, body: JSON.stringify({ error: err.message }) };
+    console.error('[isc-proxy] Error:', err)
+    return { statusCode: 500, headers: CORS, body: JSON.stringify({ error: err.message || 'Internal proxy error' }) }
   }
-};
+}
